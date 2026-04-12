@@ -1,5 +1,5 @@
 # Mocker
-Docker implemented in ~100 lines of bash. Inspired by [bocker](https://github.com/p8952/bocker), updated with Docker Hub v2 API support and extra commands.
+Docker implemented in ~300 lines of bash. Inspired by [bocker](https://github.com/p8952/bocker), updated with Docker Hub v2 API support and extra commands.
 
 **Made by: Mohammed Ouedrhiri**
 

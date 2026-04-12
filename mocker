@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# ============================================================
+#  mocker — Docker implemented in ~100 lines of Bash
+#  Made by: Mohammed Ouedrhiri
+# ============================================================
+set -o errexit -o nounset -o pipefail; shopt -s nullglob
+
+# Auto-elevate: mocker needs root for networking, namespaces and chroot
+if [[ $EUID -ne 0 ]]; then
+    exec sudo "$0" "$@"
+fi
+
+mocker_path='/var/mocker'
+cg_root='/sys/fs/cgroup'
+[[ $# -gt 0 ]] && while [ "${1:0:2}" == '--' ]; do OPTION=${1:2}; [[ $OPTION =~ = ]] && declare "MOCKER_${OPTION/=*/}=${OPTION/*=/}" || declare "MOCKER_${OPTION}=x"; shift; done
+
+# ---------------------------------------------------------------------------
+# Internal: check whether a subvolume (image or container) exists.
+# Returns 0 if found, 1 if not.
+# ---------------------------------------------------------------------------
+function mocker_check() {
+	[[ -d "$mocker_path/$1" ]] && echo 0 || echo 1
+}
+
+# ---------------------------------------------------------------------------
+# mocker init <directory>
+# Create an image from a local directory.
+# ---------------------------------------------------------------------------
+function mocker_init() { #HELP Create an image from a directory:\nMOCKER init <directory>
+	# Derive a clean image name from the directory basename
+	local raw_name
+	raw_name="$(basename "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_' | sed 's/_*$//')"
+	uuid="img_${raw_name}"
+	if [[ -d "$1" ]]; then
+		# If an image with this name already exists, remove it first
+		[[ "$(mocker_check "$uuid")" == 0 ]] && btrfs subvolume delete "$mocker_path/$uuid" > /dev/null
+		btrfs subvolume create "$mocker_path/$uuid" > /dev/null
+		cp -rf --reflink=auto "$1"/* "$mocker_path/$uuid" > /dev/null
+		[[ ! -f "$mocker_path/$uuid"/img.source ]] && echo "$1" > "$mocker_path/$uuid"/img.source
+		echo "Created: $uuid"
+	else
+		echo "No directory named '$1' exists"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# mocker pull <name> <tag>
+# Pull an image from Docker Hub using the v2 registry API.
+# Requires python3 for JSON parsing (available on virtually every Linux distro).
+# ---------------------------------------------------------------------------
+function mocker_pull() { #HELP Pull an image from Docker Hub:\nMOCKER pull <name> <tag>
+	local name="$1" tag="$2"
+	# Official images live under the 'library' namespace on the v2 API
+	[[ "$name" != */* ]] && name="library/$name"
+
+	echo "Authenticating with Docker Hub..."
+	local token
+	token="$(curl -sL \
+		"https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
+		| python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")"
+	[[ -z "$token" ]] && echo "Authentication failed for '$1'" && exit 1
+
+	local registry='https://registry-1.docker.io/v2'
+
+	echo "Fetching manifest for $1:$2..."
+	local manifest
+	manifest="$(curl -sL \
+		-H "Authorization: Bearer $token" \
+		-H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json" \
+		"$registry/$name/manifests/$tag")"
+
+	# Handle multi-platform manifest lists: pick the amd64/linux digest and re-fetch
+	local layers
+	layers="$(echo "$manifest" | python3 -c "
+import sys, json
+m = json.load(sys.stdin)
+media = m.get('mediaType', m.get('schemaVersion',''))
+# Manifest list or OCI image index: find the linux/amd64 entry
+if 'manifests' in m:
+    for entry in m['manifests']:
+        p = entry.get('platform', {})
+        if p.get('os') == 'linux' and p.get('architecture') == 'amd64':
+            print('DIGEST:' + entry['digest'])
+            sys.exit(0)
+    # Fallback: first entry
+    print('DIGEST:' + m['manifests'][0]['digest'])
+    sys.exit(0)
+# Single manifest
+if 'layers' not in m:
+    sys.exit(1)
+for layer in m['layers']:
+    print(layer['digest'])
+")" || { echo "No image named '$1:$2' exists" && exit 1; }
+
+	# If we got a manifest list digest, fetch the real single-platform manifest
+	if [[ "$layers" == DIGEST:* ]]; then
+		local platform_digest="${layers#DIGEST:}"
+		echo "Resolving platform manifest $platform_digest..."
+		manifest="$(curl -sL \
+			-H "Authorization: Bearer $token" \
+			-H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+			"$registry/$name/manifests/$platform_digest")"
+		layers="$(echo "$manifest" | python3 -c "
+import sys, json
+m = json.load(sys.stdin)
+if 'layers' not in m:
+    sys.exit(1)
+for layer in m['layers']:
+    print(layer['digest'])
+")" || { echo "No image named '$1:$2' exists" && exit 1; }
+	fi
+
+	local tmp_uuid
+	tmp_uuid="$(uuidgen)" && mkdir /tmp/"$tmp_uuid"
+
+	while IFS= read -r digest; do
+		echo "Pulling layer $digest..."
+		curl -#L \
+			-H "Authorization: Bearer $token" \
+			"$registry/$name/blobs/$digest" \
+			-o /tmp/"$tmp_uuid"/layer.tar.gz
+		# Layers are gzipped tarballs; fall back to plain tar if needed
+		tar xzf /tmp/"$tmp_uuid"/layer.tar.gz -C /tmp/"$tmp_uuid" 2>/dev/null \
+			|| tar xf /tmp/"$tmp_uuid"/layer.tar.gz -C /tmp/"$tmp_uuid" 2>/dev/null \
+			|| true
+		rm /tmp/"$tmp_uuid"/layer.tar.gz
+	done <<< "$layers"
+
+	echo "$1:$2" > /tmp/"$tmp_uuid"/img.source
+	# Override the name so the image is called img_<name>_<tag> (e.g. img_centos_7)
+	local clean_name clean_tag
+	clean_name="$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_' | sed 's/_*$//')"
+	clean_tag="$(echo "$2"  | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_' | sed 's/_*$//')"
+	local image_id="img_${clean_name}_${clean_tag}"
+	[[ "$(mocker_check "$image_id")" == 0 ]] && btrfs subvolume delete "$mocker_path/$image_id" > /dev/null
+	btrfs subvolume create "$mocker_path/$image_id" > /dev/null
+	cp -rf --reflink=auto /tmp/"$tmp_uuid"/* "$mocker_path/$image_id" > /dev/null
+	echo "$1:$2" > "$mocker_path/$image_id"/img.source
+	rm -rf /tmp/"$tmp_uuid"
+	echo "Created: $image_id"
+}
+
+# ---------------------------------------------------------------------------
+# mocker rm <image_id or container_id>
+# Delete an image or a stopped container.
+# ---------------------------------------------------------------------------
+function mocker_rm() { #HELP Delete an image or container:\nMOCKER rm <image_id or container_id>
+	[[ "$(mocker_check "$1")" == 1 ]] && echo "No image or container named '$1' exists" && exit 1
+	btrfs subvolume delete "$mocker_path/$1" > /dev/null
+	rmdir "$cg_root/$1" 2>/dev/null || true
+	echo "Removed: $1"
+}
+
+# ---------------------------------------------------------------------------
+# mocker images
+# List all available images.
+# ---------------------------------------------------------------------------
+function mocker_images() { #HELP List images:\nMOCKER images
+	echo -e "IMAGE_ID\t\tSOURCE"
+	for img in "$mocker_path"/img_*; do
+		img=$(basename "$img")
+		echo -e "$img\t\t$(cat "$mocker_path/$img/img.source")"
+	done
+}
+
+# ---------------------------------------------------------------------------
+# mocker ps
+# List all containers with their status (running / exited) and command.
+# ---------------------------------------------------------------------------
+function mocker_ps() { #HELP List containers:\nMOCKER ps
+	echo -e "CONTAINER_ID\t\tSTATUS\t\tCOMMAND"
+	for ps in "$mocker_path"/ps_*; do
+		ps=$(basename "$ps")
+		local cmd status
+		cmd="$(cat "$mocker_path/$ps/$ps.cmd" 2>/dev/null || echo 'n/a')"
+		if ps aux 2>/dev/null | grep -q "unshare.*$ps"; then
+			status="running"
+		else
+			status="exited"
+		fi
+		echo -e "$ps\t\t$status\t\t$cmd"
+	done
+}
+
+# ---------------------------------------------------------------------------
+# mocker run <image_id> <command>
+# Create and start a new container from an image.
+# ---------------------------------------------------------------------------
+function mocker_run() { #HELP Create a container:\nMOCKER run <image_id> <command>
+	[[ "$(mocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
+	# Container ID: strip the img_ prefix, append a short random suffix for uniqueness
+	local base_name="${1#img_}"
+	local suffix
+	suffix="$(shuf -i 2-254 -n 1)"
+	uuid="ps_${base_name}_${suffix}"
+	[[ "$(mocker_check "$uuid")" == 0 ]] && suffix="$(shuf -i 2-254 -n 1)" && uuid="ps_${base_name}_${suffix}"
+
+	cmd="${@:2}"
+	# suffix is 2-254: valid as an IP last-octet and fits in one MAC byte
+	local net_id="v${suffix}"                        # short interface name, e.g. v42
+	local ip_addr="$suffix"
+	local mac
+	mac="$(printf '%02x' "$suffix")"                 # e.g. 2a
+
+	# --- Networking: veth pair + dedicated network namespace ---
+	ip link add dev veth0_"$net_id" type veth peer name veth1_"$net_id"
+	ip link set dev veth0_"$net_id" up
+	ip link set veth0_"$net_id" master bridge0
+	ip netns add netns_"$uuid"
+	ip link set veth1_"$net_id" netns netns_"$uuid"
+	ip netns exec netns_"$uuid" ip link set dev lo up
+	ip netns exec netns_"$uuid" ip link set veth1_"$net_id" address "02:42:ac:11:00:$mac"
+	ip netns exec netns_"$uuid" ip addr add "10.0.0.${ip_addr}/24" dev veth1_"$net_id"
+	ip netns exec netns_"$uuid" ip link set dev veth1_"$net_id" up
+	ip netns exec netns_"$uuid" ip route add default via 10.0.0.1
+
+	# --- Filesystem: CoW snapshot of the source image ---
+	btrfs subvolume snapshot "$mocker_path/$1" "$mocker_path/$uuid" > /dev/null
+	echo 'nameserver 8.8.8.8' > "$mocker_path/$uuid"/etc/resolv.conf
+
+	# --- Metadata ---
+	echo "$cmd"  > "$mocker_path/$uuid/$uuid.cmd"
+	echo "$(date '+%Y-%m-%d %H:%M:%S')"  > "$mocker_path/$uuid/$uuid.created"
+	echo "$1" > "$mocker_path/$uuid/$uuid.image"
+
+	# --- Resource limits: cgroups v2 ---
+	local cg_path="$cg_root/$uuid"
+	mkdir -p "$cg_path"
+	# Enable cpu and memory controllers for children of root cgroup
+	echo "+cpu +memory" > "$cg_root/cgroup.subtree_control" 2>/dev/null || true
+	: "${MOCKER_CPU_SHARE:=512}"
+	: "${MOCKER_MEM_LIMIT:=512}"
+	echo "$MOCKER_CPU_SHARE"                            > "$cg_path/cpu.weight"      2>/dev/null || true
+	echo "$((MOCKER_MEM_LIMIT * 1000000))"              > "$cg_path/memory.max"      2>/dev/null || true
+
+	# --- Process isolation: namespaces + chroot, run inside the cgroup ---
+	# Use a subshell: write current PID into cgroup.procs before exec-ing unshare
+	(
+		echo $$ > "$cg_path/cgroup.procs"
+		exec ip netns exec netns_"$uuid" \
+			unshare -fmuip --mount-proc \
+			chroot "$mocker_path/$uuid" \
+			/bin/sh -c "/bin/mount -t proc proc /proc && $cmd"
+	) 2>&1 | tee "$mocker_path/$uuid/$uuid.log" || true
+
+	# --- Cleanup: networking + cgroup ---
+	ip link del dev veth0_"$net_id"
+	ip netns del netns_"$uuid"
+	rmdir "$cg_path" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# mocker exec <container_id> <command>
+# Execute a command inside an already-running container.
+# ---------------------------------------------------------------------------
+function mocker_exec() { #HELP Execute a command in a running container:\nMOCKER exec <container_id> <command>
+	[[ "$(mocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
+	cid="$(ps o ppid,pid | grep "^$(ps o pid,cmd | grep -E "^\ *[0-9]+ unshare.*$1" | awk '{print $1}')" | awk '{print $2}')"
+	[[ ! "$cid" =~ ^\ *[0-9]+$ ]] && echo "Container '$1' exists but is not running" && exit 1
+	nsenter -t "$cid" -m -u -i -n -p chroot "$mocker_path/$1" "${@:2}"
+}
+
+# ---------------------------------------------------------------------------
+# mocker logs <container_id>
+# Print stdout/stderr captured from a container.
+# ---------------------------------------------------------------------------
+function mocker_logs() { #HELP View logs from a container:\nMOCKER logs <container_id>
+	[[ "$(mocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
+	cat "$mocker_path/$1/$1.log"
+}
+
+# ---------------------------------------------------------------------------
+# mocker commit <container_id> <image_id>
+# Save the state of a container as an image.
+# ---------------------------------------------------------------------------
+function mocker_commit() { #HELP Commit a container to an image:\nMOCKER commit <container_id> <image_id>
+	[[ "$(mocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
+	[[ "$(mocker_check "$2")" == 1 ]] && echo "No image named '$2' exists" && exit 1
+	mocker_rm "$2" && btrfs subvolume snapshot "$mocker_path/$1" "$mocker_path/$2" > /dev/null
+	echo "Created: $2"
+}
+
+# ---------------------------------------------------------------------------
+# mocker inspect <id>
+# Show metadata for an image or container.
+# ---------------------------------------------------------------------------
+function mocker_inspect() { #HELP Show details of an image or container:\nMOCKER inspect <id>
+	[[ "$(mocker_check "$1")" == 1 ]] && echo "No image or container named '$1' exists" && exit 1
+	echo "=== $1 ==="
+	echo "Source : $(cat "$mocker_path/$1/img.source"    2>/dev/null || echo 'n/a')"
+	echo "Image  : $(cat "$mocker_path/$1/$1.image"      2>/dev/null || echo 'n/a')"
+	echo "Created: $(cat "$mocker_path/$1/$1.created"    2>/dev/null || echo 'n/a')"
+	echo "Command: $(cat "$mocker_path/$1/$1.cmd"        2>/dev/null || echo 'n/a')"
+	echo "Size   : $(du -sh "$mocker_path/$1" | cut -f1)"
+}
+
+# ---------------------------------------------------------------------------
+# mocker tag <image_id> <new_image_id>
+# Create a new image name pointing to the same filesystem snapshot.
+# ---------------------------------------------------------------------------
+function mocker_tag() { #HELP Tag an image with a new ID:\nMOCKER tag <image_id> <new_image_id>
+	[[ "$(mocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
+	[[ "$(mocker_check "$2")" == 0 ]] && echo "Image '$2' already exists" && exit 1
+	btrfs subvolume snapshot "$mocker_path/$1" "$mocker_path/$2" > /dev/null
+	cat "$mocker_path/$1/img.source" > "$mocker_path/$2/img.source"
+	echo "Tagged: $1 -> $2"
+}
+
+# ---------------------------------------------------------------------------
+# mocker help
+# ---------------------------------------------------------------------------
+function mocker_help() { #HELP Display this message:\nMOCKER help
+	sed -n "s/^.*#HELP\\s//p;" < "$1" | sed "s/\\\\n/\n\t/g;s/$/\n/;s!MOCKER!${1/!/\\!}!g"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+[[ -z "${1-}" ]] && mocker_help "$0"
+case $1 in
+	pull|init|rm|images|ps|run|exec|logs|commit|inspect|tag) mocker_"$1" "${@:2}" ;;
+	*) mocker_help "$0" ;;
+esac
